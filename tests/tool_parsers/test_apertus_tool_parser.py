@@ -447,3 +447,26 @@ class TestStreamingExtraction:
         assert len(tc) == 1
         assert tc[0]["name"] == "get_weather"
         assert json.loads(tc[0]["arguments"]) == {"location": "London"}
+
+    def test_streaming_long_string_and_nested_containers(self, parser, mock_request):
+        """Verifies incremental open-string streaming across nested objects,
+        arrays, trailing delimiter characters, and escaped sequences."""
+        expected_args = {
+            "content": "line 1: {a, b}, [c, d] " * 40 + 'quoted: "ok"',
+            "items": [
+                {"key_a": "value_a, [1] ", "key_b": "value_b}"},
+                {"key_a": "second_item", "key_b": "done"},
+            ],
+        }
+        payload = (
+            f"{TOOL_CALLS_PREFIX}"
+            f'[{{"write_data": {json.dumps(expected_args, ensure_ascii=False)}}}]'
+            f"{TOOL_CALLS_SUFFIX}"
+        )
+        chunks = [payload[i : i + 4] for i in range(0, len(payload), 4)]
+        results = self._simulate_streaming(parser, mock_request, chunks)
+
+        tc = self._collect_tool_calls(results)
+        assert len(tc) == 1
+        assert tc[0]["name"] == "write_data"
+        assert json.loads(tc[0]["arguments"]) == expected_args

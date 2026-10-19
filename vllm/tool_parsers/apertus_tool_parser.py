@@ -41,6 +41,8 @@ logger = init_logger(__name__)
 # Apertus special tokens for tool calls
 TOOL_CALLS_PREFIX = "<|tools_prefix|>"
 TOOL_CALLS_SUFFIX = "<|tools_suffix|>"
+_STRIP_TRAILING_CHARS = '}"], '
+_RAW_DECODE = json.JSONDecoder().raw_decode
 
 
 class ApertusToolParser(ToolParser):
@@ -110,6 +112,114 @@ class ApertusToolParser(ToolParser):
         self.current_tool_id = -1
         self.current_tool_name_sent = False
         self.streamed_args_for_tool: list[str] = []
+        self._last_prefix_idx: int = -1
+        self._last_suffix_idx: int = -1
+        self._last_text_len: int = 0
+        self._active_prefix_idx: int = -1
+        self._json_body_start: int = -1
+        self._json_scan_pos: int = 0
+        self._container_stack: list[str] = []
+        self._json_in_string: bool = False
+        self._json_escape: bool = False
+        self._json_started: bool = False
+        self._json_closed_idx: int | None = None
+        self._last_sig_char: str = ""
+        self._in_string_is_value: bool = False
+        self._open_str_tool_id: int = -1
+        self._open_str_pending_tail: str | None = None
+        self._open_str_json_len: int = 0
+
+    def _advance_json_scan(self, current_text: str, prefix_idx: int) -> None:
+        """Incrementally scans the active JSON block after `TOOL_CALLS_PREFIX`."""
+        json_start = prefix_idx + len(TOOL_CALLS_PREFIX)
+        if (
+            prefix_idx != self._active_prefix_idx
+            or len(current_text) < self._json_scan_pos
+        ):
+            self._active_prefix_idx = prefix_idx
+            self._json_body_start = -1
+            self._json_scan_pos = json_start
+            self._container_stack = []
+            self._json_in_string = False
+            self._json_escape = False
+            self._json_started = False
+            self._json_closed_idx = None
+            self._last_sig_char = ""
+            self._in_string_is_value = False
+            self._open_str_tool_id = -1
+            self._open_str_pending_tail = None
+            self._open_str_json_len = 0
+
+        if self._json_closed_idx is not None:
+            return
+
+        i = self._json_scan_pos
+        n = len(current_text)
+        while i < n:
+            ch = current_text[i]
+            if not self._json_started:
+                if ch.isspace():
+                    i += 1
+                    continue
+                self._json_body_start = i
+                self._json_started = True
+
+            if self._json_in_string:
+                if self._json_escape:
+                    self._json_escape = False
+                elif ch == "\\":
+                    self._json_escape = True
+                    self._open_str_pending_tail = None
+                elif ch == '"':
+                    self._json_in_string = False
+                    self._in_string_is_value = False
+                    self._open_str_pending_tail = None
+                    self._last_sig_char = '"'
+            else:
+                if ch == '"':
+                    self._json_in_string = True
+                    self._in_string_is_value = len(self._container_stack) >= 3 and (
+                        self._last_sig_char == ":"
+                        or (
+                            self._container_stack[-1] == "["
+                            and self._last_sig_char in ("[", ",")
+                        )
+                    )
+                elif ch == "[":
+                    self._container_stack.append("[")
+                    self._last_sig_char = "["
+                elif ch == "]":
+                    if self._container_stack and self._container_stack[-1] == "[":
+                        self._container_stack.pop()
+                    self._last_sig_char = "]"
+                    if not self._container_stack and self._json_body_start >= 0:
+                        try:
+                            _, idx = _RAW_DECODE(current_text, self._json_body_start)
+                            self._json_closed_idx = idx
+                            i = idx
+                            break
+                        except Exception:
+                            pass
+                elif ch == "{":
+                    self._container_stack.append("{")
+                    self._last_sig_char = "{"
+                elif ch == "}":
+                    if self._container_stack and self._container_stack[-1] == "{":
+                        self._container_stack.pop()
+                    self._last_sig_char = "}"
+                    if not self._container_stack and self._json_body_start >= 0:
+                        try:
+                            _, idx = _RAW_DECODE(current_text, self._json_body_start)
+                            self._json_closed_idx = idx
+                            i = idx
+                            break
+                        except Exception:
+                            pass
+                elif not ch.isspace():
+                    self._last_sig_char = ch
+            i += 1
+
+        self._json_scan_pos = i
 
     def adjust_request(
         self, request: ChatCompletionRequest | ResponsesRequest
@@ -308,8 +418,29 @@ class ApertusToolParser(ToolParser):
         if not delta_text:
             return None
 
+        if len(current_text) < self._last_text_len or (
+            self._last_prefix_idx == -1 and self._last_text_len == 0
+        ):
+            self._last_prefix_idx = current_text.rfind(TOOL_CALLS_PREFIX)
+            self._last_suffix_idx = current_text.rfind(TOOL_CALLS_SUFFIX)
+        else:
+            search_from = max(0, self._last_text_len - len(TOOL_CALLS_PREFIX))
+            if TOOL_CALLS_PREFIX in delta_text or (
+                current_text.find(TOOL_CALLS_PREFIX, search_from) != -1
+            ):
+                self._last_prefix_idx = current_text.rfind(
+                    TOOL_CALLS_PREFIX, search_from
+                )
+            if TOOL_CALLS_SUFFIX in delta_text or (
+                current_text.find(TOOL_CALLS_SUFFIX, search_from) != -1
+            ):
+                self._last_suffix_idx = current_text.rfind(
+                    TOOL_CALLS_SUFFIX, search_from
+                )
+        self._last_text_len = len(current_text)
+
         # Fast path: normal text generation before any tools are invoked
-        if TOOL_CALLS_PREFIX not in current_text:
+        if self._last_prefix_idx == -1:
             return DeltaMessage(content=delta_text)
 
         try:
@@ -332,8 +463,8 @@ class ApertusToolParser(ToolParser):
             A `DeltaMessage` containing the `content` delta and/or `tool_calls` delta.
 
         """
-        prefix_idx = current_text.rfind(TOOL_CALLS_PREFIX)
-        suffix_idx = current_text.rfind(TOOL_CALLS_SUFFIX)
+        prefix_idx = self._last_prefix_idx
+        suffix_idx = self._last_suffix_idx
 
         is_inside_tools = prefix_idx > suffix_idx
 
@@ -342,16 +473,10 @@ class ApertusToolParser(ToolParser):
 
         # Check if the JSON array successfully closed implicitly
         if is_inside_tools:
-            json_start = prefix_idx + len(TOOL_CALLS_PREFIX)
-            s = current_text[json_start:].lstrip()
-            try:
-                # If raw_decode succeeds,
-                # the JSON array is fully formed and implicitly closed
-                _, idx = json.JSONDecoder().raw_decode(s)
-                json_end_idx = len(current_text) - len(s) + idx
+            self._advance_json_scan(current_text, prefix_idx)
+            if self._json_closed_idx is not None:
+                json_end_idx = self._json_closed_idx
                 json_completed, is_inside_tools = True, False
-            except Exception:
-                pass
 
         just_finished = (TOOL_CALLS_SUFFIX in delta_text) or json_completed
 
@@ -386,10 +511,56 @@ class ApertusToolParser(ToolParser):
 
         # 3. Extract the isolated JSON array string for the active block
         json_start = prefix_idx + len(TOOL_CALLS_PREFIX)
-        json_end = suffix_idx if suffix_idx > prefix_idx else json_end_idx
-        json_str = current_text[json_start:json_end]
+        json_end = (
+            suffix_idx
+            if suffix_idx > prefix_idx
+            else (json_end_idx if json_end_idx is not None else len(current_text))
+        )
+        json_len = json_end - json_start
+        is_final = not is_inside_tools
 
-        tool_calls = self._parse_and_diff_json(json_str, is_final=not is_inside_tools)
+        if (
+            not is_final
+            and self.current_tool_id >= 0
+            and self.current_tool_name_sent
+            and self._open_str_pending_tail is not None
+            and self._open_str_tool_id == self.current_tool_id
+            and json_len > self._open_str_json_len
+        ):
+            added = current_text[json_start + self._open_str_json_len : json_end]
+            if (
+                '"' not in added
+                and "\\" not in added
+                and all(ord(c) >= 0x20 for c in added)
+            ):
+                combined = self._open_str_pending_tail + added
+                diff = combined.rstrip(_STRIP_TRAILING_CHARS)
+                self._open_str_pending_tail = combined[len(diff) :]
+                self._open_str_json_len = json_len
+                tool_calls = (
+                    [
+                        DeltaToolCall(
+                            index=self.current_tool_id,
+                            function=DeltaFunctionCall(arguments=diff).model_dump(
+                                exclude_none=True
+                            ),
+                        )
+                    ]
+                    if diff
+                    else []
+                )
+                if diff:
+                    self.streamed_args_for_tool[self.current_tool_id] += diff
+                if tool_calls or content_str:
+                    return DeltaMessage(
+                        content=content_str if content_str else None,
+                        tool_calls=tool_calls if tool_calls else None,
+                    )
+                return None
+            self._open_str_pending_tail = None
+
+        json_str = current_text[json_start:json_end]
+        tool_calls = self._parse_and_diff_json(json_str, is_final=is_final)
 
         if tool_calls or content_str:
             return DeltaMessage(
@@ -416,6 +587,37 @@ class ApertusToolParser(ToolParser):
             to stream back to the client.
 
         """
+        if (
+            not is_final
+            and self.current_tool_id >= 0
+            and self.current_tool_name_sent
+            and self._open_str_pending_tail is not None
+            and self._open_str_tool_id == self.current_tool_id
+            and len(json_str) > self._open_str_json_len
+        ):
+            added = json_str[self._open_str_json_len :]
+            if (
+                '"' not in added
+                and "\\" not in added
+                and all(ord(c) >= 0x20 for c in added)
+            ):
+                combined = self._open_str_pending_tail + added
+                diff = combined.rstrip(_STRIP_TRAILING_CHARS)
+                self._open_str_pending_tail = combined[len(diff) :]
+                self._open_str_json_len = len(json_str)
+                if diff:
+                    self.streamed_args_for_tool[self.current_tool_id] += diff
+                    return [
+                        DeltaToolCall(
+                            index=self.current_tool_id,
+                            function=DeltaFunctionCall(arguments=diff).model_dump(
+                                exclude_none=True
+                            ),
+                        )
+                    ]
+                return []
+            self._open_str_pending_tail = None
+
         try:
             # An exponent can change a number's already-streamed representation.
             flags = Allow.ALL if is_final else Allow.ALL & ~Allow.NUM
@@ -437,7 +639,9 @@ class ApertusToolParser(ToolParser):
                 if not self.current_tool_name_sent:
                     self._emit_tool_name(parsed, self.current_tool_id, tool_calls)
 
-                delta = self._get_tool_diff(parsed, self.current_tool_id, is_final=True)
+                delta = self._get_tool_diff(
+                    parsed, self.current_tool_id, is_final=True, json_str=json_str
+                )
                 if delta:
                     tool_calls.append(delta)
 
@@ -451,7 +655,9 @@ class ApertusToolParser(ToolParser):
             if not self.current_tool_name_sent:
                 self._emit_tool_name(parsed, self.current_tool_id, tool_calls)
 
-            delta = self._get_tool_diff(parsed, self.current_tool_id, is_final)
+            delta = self._get_tool_diff(
+                parsed, self.current_tool_id, is_final, json_str=json_str
+            )
             if delta:
                 tool_calls.append(delta)
 
@@ -489,7 +695,11 @@ class ApertusToolParser(ToolParser):
             )
 
     def _get_tool_diff(
-        self, parsed: list, index: int, is_final: bool
+        self,
+        parsed: list,
+        index: int,
+        is_final: bool,
+        json_str: str | None = None,
     ) -> DeltaToolCall | None:
         """Calculates the exact string difference to safely append new tool parameters.
 
@@ -501,6 +711,7 @@ class ApertusToolParser(ToolParser):
             index: The active tool's array index.
             is_final: Whether to emit
                 trailing structural brackets (True if block is done).
+            json_str: Optional raw JSON string for incremental open-string state.
 
         Returns:
             A `DeltaToolCall` mapping to the arguments diff,
@@ -522,13 +733,30 @@ class ApertusToolParser(ToolParser):
         if args is None:
             return None
 
-        args_json = json.dumps(args, ensure_ascii=False)
+        args_json_full = json.dumps(args, ensure_ascii=False)
+        args_json = (
+            args_json_full if is_final else args_json_full.rstrip(_STRIP_TRAILING_CHARS)
+        )
 
-        # Suppress trailing structural characters
-        # during stream (looks cleaner in frontends)
-        if not is_final:
-            while args_json and args_json[-1] in ("}", '"', "]", " ", ","):
-                args_json = args_json[:-1]
+        if (
+            not is_final
+            and json_str is not None
+            and self._json_in_string
+            and self._in_string_is_value
+            and not self._json_escape
+            and not json_str.endswith("\\")
+        ):
+            closing_count = len(self._container_stack) - 1
+            if (
+                closing_count > 0
+                and len(args_json_full) > closing_count
+                and len(args_json) > 0
+            ):
+                prefix_candidate = args_json_full[:-closing_count]
+                if prefix_candidate.rstrip(_STRIP_TRAILING_CHARS) == args_json:
+                    self._open_str_tool_id = index
+                    self._open_str_pending_tail = prefix_candidate[len(args_json) :]
+                    self._open_str_json_len = len(json_str)
 
         prev_sent = self.streamed_args_for_tool[index]
         if args_json == prev_sent:
@@ -538,6 +766,7 @@ class ApertusToolParser(ToolParser):
         if len(prefix) < len(prev_sent):
             # Backtrack state if partial parser structurally updates a past assumption
             self.streamed_args_for_tool[index] = prefix
+            self._open_str_pending_tail = None
             return None
 
         diff = args_json[len(prev_sent) :]

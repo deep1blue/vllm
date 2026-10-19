@@ -348,3 +348,36 @@ def test_streaming_tool_call_with_large_steps(
     assert call.function.name == "manage_user_memory"
     args_dict = json.loads(call.function.arguments)
     assert args_dict == COMPLEX_ARGS_DICT
+
+
+def test_streaming_tool_call_nested_and_escaped_strings(
+    gigachat_tokenizer: TokenizerLike,
+):
+    """Test incremental streaming with braces and escaped quotes inside strings."""
+    nested_args = {
+        "code": 'def f():\n    return {"a": "}not_end}", "b": [1, 2]}\n' * 20,
+        "meta": {"nested": {"flag": True}},
+    }
+    func_json = json.dumps(
+        {"name": "write_code", "arguments": nested_args}, ensure_ascii=False
+    )
+    deltas = [
+        CONTENT_TEXT,
+        TOOL_HEADER_GIGACHAT31,
+        *[func_json[i : i + 4] for i in range(0, len(func_json), 4)],
+        EOS_TOKEN,
+    ]
+
+    tool_parser: ToolParser = ToolParserManager.get_tool_parser("gigachat3")(
+        gigachat_tokenizer
+    )
+    reconstructor = run_tool_extraction_streaming(
+        tool_parser,
+        deltas,
+        assert_one_tool_per_delta=False,
+    )
+    assert reconstructor.other_content == CONTENT_TEXT
+    assert len(reconstructor.tool_calls) == 1
+    call = reconstructor.tool_calls[0]
+    assert call.function.name == "write_code"
+    assert json.loads(call.function.arguments) == nested_args
